@@ -1,0 +1,26 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0.0",
+  "FriendlyName": "Puerts Blueprint TypeScript Generator",
+  "Description": "Generates Puerts Blueprint mixin TypeScript files from Content Browser selections.",
+  "Category": "Scripting",
+  "CreatedBy": "HarbinCampus",
+  "CanContainContent": false,
+  "EnabledByDefault": false,
+  "IsBetaVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "PuertsBlueprintTsGenerator",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "Puerts",
+      "Enabled": true
+    }
+  ]
+}

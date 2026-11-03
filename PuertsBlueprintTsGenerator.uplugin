@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
-  "Version": 1,
-  "VersionName": "1.0.0",
+  "Version": 5,
+  "VersionName": "1.2.2",
   "FriendlyName": "Puerts Blueprint TypeScript Generator",
   "Description": "Generates Puerts Blueprint mixin TypeScript files from Content Browser selections.",
   "Category": "Scripting",

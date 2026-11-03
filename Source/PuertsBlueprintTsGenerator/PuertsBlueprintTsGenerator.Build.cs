@@ -22,6 +22,7 @@ public class PuertsBlueprintTsGenerator : ModuleRules
                 "AssetRegistry",
                 "Kismet",
                 "ContentBrowser",
+                "EngineSettings",
                 "Projects",
                 "Slate",
                 "SlateCore",

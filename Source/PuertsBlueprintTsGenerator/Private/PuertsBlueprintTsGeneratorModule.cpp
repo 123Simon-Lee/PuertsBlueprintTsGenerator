@@ -5,10 +5,14 @@
 #include "Brushes/SlateImageBrush.h"
 #include "ContentBrowserModule.h"
 #include "Engine/Blueprint.h"
+#include "Engine/GameInstance.h"
+#include "FileHelpers.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Framework/Notifications/NotificationManager.h"
+#include "GameMapsSettings.h"
 #include "HAL/FileManager.h"
 #include "Interfaces/IPluginManager.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Misc/FileHelper.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
@@ -17,6 +21,8 @@
 #include "Styling/SlateStyle.h"
 #include "Styling/SlateStyleRegistry.h"
 #include "Toolkits/AssetEditorToolkit.h"
+#include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 #include "UObject/WeakObjectPtr.h"
 #include "Widgets/Notifications/SNotificationList.h"
 
@@ -28,6 +34,15 @@ namespace PuertsBlueprintTsGenerator
 {
 const FName StyleSetName(TEXT("PuertsBlueprintTsGeneratorStyle"));
 const FName GenerateIconName(TEXT("PuertsBlueprintTsGenerator.Generate"));
+const FName GameInstanceMixinClassesPropertyName(
+    TEXT("PuertsMixinBlueprintClasses"));
+
+enum class EExistingFileAction : uint8
+{
+    Skip,
+    Overwrite,
+    UpdateTemplatePreservingImplementation
+};
 
 FString SanitizeTypeScriptIdentifier(const FString& Source)
 {
@@ -84,6 +99,177 @@ FString NormalizeVirtualRoot(FString RootPath)
     }
 
     return RootPath;
+}
+
+FString BuildClassLoadLoaderBlock(
+    const FString& GeneratedClassPath,
+    const FString& Newline)
+{
+    return FString::Printf(
+        TEXT("const UClass = UE.Class.Load(%s")
+        TEXT("  \"%s\",%s")
+        TEXT(");%s%s")
+        TEXT("const JSClass = blueprint.tojs(UClass);"),
+        *Newline,
+        *GeneratedClassPath,
+        *Newline,
+        *Newline,
+        *Newline);
+}
+
+/**
+ * 1.1.0 模板会在 blueprint.load 后继续使用加载前的局部占位对象。
+ * Puerts 会替换 UE.Game 命名空间中的属性，却不会改变该局部变量，因而调用
+ * BPClass.StaticClass() 会在运行时失败。保留这个构造器仅用于迁移已有脚本。
+ */
+FString BuildStaleStaticClassLoaderBlock(
+    const FString& UnrealTypeName,
+    const FString& Newline)
+{
+    return FString::Printf(
+        TEXT("const BPClass =%s")
+        TEXT("  %s;%s%s")
+        TEXT("blueprint.load(BPClass);%s%s")
+        TEXT("const jsClass = blueprint.tojs(%s")
+        TEXT("  BPClass.StaticClass(),%s")
+        TEXT(");"),
+        *Newline,
+        *UnrealTypeName,
+        *Newline,
+        *Newline,
+        *Newline,
+        *Newline,
+        *Newline,
+        *Newline);
+}
+
+/** 1.2.1 中加载占位类型后重新从 UE.Game 命名空间取类的模板。 */
+FString BuildReloadedStaticClassLoaderBlock(
+    const FString& UnrealTypeName,
+    const FString& Newline)
+{
+    return FString::Printf(
+        TEXT("const UnloadedBPClass =%s")
+        TEXT("  %s;%s%s")
+        TEXT("blueprint.load(UnloadedBPClass);%s%s")
+        TEXT("const BPClass =%s")
+        TEXT("  %s;%s%s")
+        TEXT("const jsClass = blueprint.tojs(%s")
+        TEXT("  BPClass.StaticClass(),%s")
+        TEXT(");"),
+        *Newline,
+        *UnrealTypeName,
+        *Newline,
+        *Newline,
+        *Newline,
+        *Newline,
+        *Newline,
+        *UnrealTypeName,
+        *Newline,
+        *Newline,
+        *Newline,
+        *Newline);
+}
+
+bool FindLegacyBlueprintLoaderRange(
+    const FString& Source,
+    const FString& GeneratedClassPath,
+    int32& OutStartIndex,
+    int32& OutLength)
+{
+    OutStartIndex = INDEX_NONE;
+    OutLength = 0;
+
+    const FString QuotedClassPath =
+        TEXT("\"") + GeneratedClassPath + TEXT("\"");
+    const int32 ClassPathIndex = Source.Find(
+        QuotedClassPath,
+        ESearchCase::CaseSensitive);
+    if (ClassPathIndex == INDEX_NONE)
+    {
+        return false;
+    }
+
+    const int32 LoaderStartIndex = Source.Left(ClassPathIndex).Find(
+        TEXT("const UClass"),
+        ESearchCase::CaseSensitive,
+        ESearchDir::FromEnd);
+    static const FString LegacyToJsStatement =
+        TEXT("const JSClass = blueprint.tojs(UClass);");
+    const int32 ToJsStatementIndex = Source.Find(
+        LegacyToJsStatement,
+        ESearchCase::CaseSensitive,
+        ESearchDir::FromStart,
+        ClassPathIndex + QuotedClassPath.Len());
+    if (LoaderStartIndex == INDEX_NONE || ToJsStatementIndex == INDEX_NONE)
+    {
+        return false;
+    }
+
+    const int32 LoaderEndIndex =
+        ToJsStatementIndex + LegacyToJsStatement.Len();
+    const FString CandidateBlock = Source.Mid(
+        LoaderStartIndex,
+        LoaderEndIndex - LoaderStartIndex);
+    if (CandidateBlock.Len() > 1024 ||
+        !CandidateBlock.Contains(TEXT("UE.Class.Load(")))
+    {
+        return false;
+    }
+
+    OutStartIndex = LoaderStartIndex;
+    OutLength = LoaderEndIndex - LoaderStartIndex;
+    return true;
+}
+
+bool IsTypeScriptIdentifierCharacter(const TCHAR Character)
+{
+    return FChar::IsAlnum(Character) ||
+        Character == TEXT('_') ||
+        Character == TEXT('$');
+}
+
+int32 ReplaceTypeScriptIdentifier(
+    FString& Source,
+    const FString& OldIdentifier,
+    const FString& NewIdentifier)
+{
+    int32 ReplacementCount = 0;
+    int32 SearchFrom = 0;
+
+    while (SearchFrom < Source.Len())
+    {
+        const int32 MatchIndex = Source.Find(
+            OldIdentifier,
+            ESearchCase::CaseSensitive,
+            ESearchDir::FromStart,
+            SearchFrom);
+        if (MatchIndex == INDEX_NONE)
+        {
+            break;
+        }
+
+        const int32 MatchEnd = MatchIndex + OldIdentifier.Len();
+        const bool bHasIdentifierBefore = MatchIndex > 0 &&
+            IsTypeScriptIdentifierCharacter(Source[MatchIndex - 1]);
+        const bool bHasIdentifierAfter = MatchEnd < Source.Len() &&
+            IsTypeScriptIdentifierCharacter(Source[MatchEnd]);
+
+        if (!bHasIdentifierBefore && !bHasIdentifierAfter)
+        {
+            Source = Source.Left(MatchIndex) +
+                NewIdentifier +
+                Source.Mid(MatchEnd);
+            SearchFrom = MatchIndex + NewIdentifier.Len();
+            ++ReplacementCount;
+        }
+        else
+        {
+            SearchFrom = MatchEnd;
+        }
+    }
+
+    return ReplacementCount;
 }
 } // namespace PuertsBlueprintTsGenerator
 
@@ -364,6 +550,154 @@ private:
         GenerateBlueprints(MoveTemp(Blueprints));
     }
 
+    bool BindBlueprintsToGameInstance(
+        const TArray<UBlueprint*>& Blueprints,
+        int32& OutAddedReferenceCount,
+        FString& OutErrorMessage) const
+    {
+        OutAddedReferenceCount = 0;
+        OutErrorMessage.Reset();
+
+        const UPuertsBlueprintTsGeneratorSettings* Settings =
+            GetDefault<UPuertsBlueprintTsGeneratorSettings>();
+        if (!Settings->bBindGeneratedBlueprintsToGameInstance)
+        {
+            return true;
+        }
+
+        const UGameMapsSettings* GameMapsSettings =
+            GetDefault<UGameMapsSettings>();
+        const FSoftClassPath& GameInstanceClassPath =
+            GameMapsSettings->GameInstanceClass;
+        UClass* GameInstanceClass =
+            GameInstanceClassPath.TryLoadClass<UGameInstance>();
+        if (!IsValid(GameInstanceClass))
+        {
+            OutErrorMessage = FString::Printf(
+                TEXT("无法加载项目 GameInstance 类：%s"),
+                *GameInstanceClassPath.ToString());
+            return false;
+        }
+
+        UBlueprint* GameInstanceBlueprint =
+            Cast<UBlueprint>(GameInstanceClass->ClassGeneratedBy);
+        if (!IsValid(GameInstanceBlueprint))
+        {
+            OutErrorMessage = FString::Printf(
+                TEXT("当前 GameInstance 不是可保存的蓝图类：%s"),
+                *GameInstanceClass->GetPathName());
+            return false;
+        }
+
+        UObject* GameInstanceDefaultObject =
+            GameInstanceClass->GetDefaultObject();
+        FArrayProperty* MixinClassesProperty = FindFProperty<FArrayProperty>(
+            GameInstanceClass,
+            PuertsBlueprintTsGenerator::GameInstanceMixinClassesPropertyName);
+        FClassProperty* MixinClassProperty = MixinClassesProperty
+            ? CastField<FClassProperty>(MixinClassesProperty->Inner)
+            : nullptr;
+        if (!IsValid(GameInstanceDefaultObject) || !MixinClassProperty)
+        {
+            OutErrorMessage = FString::Printf(
+                TEXT("GameInstance 类 %s 缺少 TArray<TSubclassOf<UObject>> 属性 %s。"
+                     "请先编译 DTSCore。"),
+                *GameInstanceClass->GetPathName(),
+                *PuertsBlueprintTsGenerator::
+                    GameInstanceMixinClassesPropertyName.ToString());
+            return false;
+        }
+
+        void* MixinClassesAddress =
+            MixinClassesProperty->ContainerPtrToValuePtr<void>(
+                GameInstanceDefaultObject);
+        FScriptArrayHelper MixinClassesHelper(
+            MixinClassesProperty,
+            MixinClassesAddress);
+
+        TArray<UClass*> ClassesToAdd;
+        for (const UBlueprint* Blueprint : Blueprints)
+        {
+            UClass* GeneratedClass = IsValid(Blueprint)
+                ? Blueprint->GeneratedClass
+                : nullptr;
+            if (!IsValid(GeneratedClass) ||
+                GeneratedClass == GameInstanceClass)
+            {
+                continue;
+            }
+
+            bool bAlreadyReferenced = false;
+            for (int32 Index = 0;
+                 Index < MixinClassesHelper.Num();
+                 ++Index)
+            {
+                if (MixinClassProperty->GetObjectPropertyValue(
+                        MixinClassesHelper.GetRawPtr(Index)) == GeneratedClass)
+                {
+                    bAlreadyReferenced = true;
+                    break;
+                }
+            }
+
+            if (!bAlreadyReferenced)
+            {
+                ClassesToAdd.AddUnique(GeneratedClass);
+            }
+        }
+
+        if (ClassesToAdd.IsEmpty())
+        {
+            return true;
+        }
+
+        GameInstanceBlueprint->Modify();
+        GameInstanceDefaultObject->Modify();
+        GameInstanceDefaultObject->PreEditChange(MixinClassesProperty);
+
+        for (UClass* GeneratedClass : ClassesToAdd)
+        {
+            const int32 NewIndex = MixinClassesHelper.AddValue();
+            MixinClassProperty->SetObjectPropertyValue(
+                MixinClassesHelper.GetRawPtr(NewIndex),
+                GeneratedClass);
+        }
+
+        OutAddedReferenceCount = ClassesToAdd.Num();
+        FPropertyChangedEvent PropertyChangedEvent(
+            MixinClassesProperty,
+            EPropertyChangeType::ArrayAdd);
+        GameInstanceDefaultObject->PostEditChangeProperty(
+            PropertyChangedEvent);
+        FBlueprintEditorUtils::MarkBlueprintAsModified(
+            GameInstanceBlueprint,
+            PropertyChangedEvent);
+
+        TArray<UPackage*> PackagesToSave;
+        PackagesToSave.Add(GameInstanceBlueprint->GetOutermost());
+        TArray<UPackage*> FailedPackages;
+        const FEditorFileUtils::EPromptReturnCode SaveResult =
+            FEditorFileUtils::PromptForCheckoutAndSave(
+                PackagesToSave,
+                true,
+                false,
+                &FailedPackages,
+                false,
+                false);
+        if (SaveResult != FEditorFileUtils::PR_Success ||
+            !FailedPackages.IsEmpty())
+        {
+            OutErrorMessage = FString::Printf(
+                TEXT("已在内存中添加 %d 个 GameInstance 硬引用，但保存 %s 失败。"
+                     "请手动保存该蓝图。"),
+                OutAddedReferenceCount,
+                *GameInstanceBlueprint->GetPathName());
+            return false;
+        }
+
+        return true;
+    }
+
     void GenerateBlueprints(TArray<UBlueprint*> Blueprints)
     {
         int32 ExistingFileCount = 0;
@@ -375,16 +709,28 @@ private:
             }
         }
 
-        bool bOverwriteExistingFiles = false;
+        PuertsBlueprintTsGenerator::EExistingFileAction ExistingFileAction =
+            PuertsBlueprintTsGenerator::EExistingFileAction::Skip;
         if (ExistingFileCount > 0)
         {
+            const UPuertsBlueprintTsGeneratorSettings* Settings =
+                GetDefault<UPuertsBlueprintTsGeneratorSettings>();
+            const bool bPreserveImplementation =
+                Settings->bPreserveExistingImplementationOnRegenerate;
             const EAppReturnType::Type Answer = FMessageDialog::Open(
                 EAppMsgType::YesNoCancel,
                 FText::Format(
-                    LOCTEXT(
-                        "ConfirmOverwrite",
-                        "已有 {0} 个 TypeScript 文件。\n\n"
-                        "选择“是”覆盖；选择“否”只生成缺失文件；选择“取消”停止。"),
+                    bPreserveImplementation
+                        ? LOCTEXT(
+                              "ConfirmTemplateUpdate",
+                              "已有 {0} 个 TypeScript 文件。\n\n"
+                              "选择“是”只更新蓝图加载模板并保留已有实现；"
+                              "选择“否”只生成缺失文件；选择“取消”停止。")
+                        : LOCTEXT(
+                              "ConfirmOverwrite",
+                              "已有 {0} 个 TypeScript 文件。\n\n"
+                              "选择“是”完整覆盖；选择“否”只生成缺失文件；"
+                              "选择“取消”停止。"),
                     FText::AsNumber(ExistingFileCount)));
 
             if (Answer == EAppReturnType::Cancel)
@@ -392,21 +738,32 @@ private:
                 return;
             }
 
-            bOverwriteExistingFiles = Answer == EAppReturnType::Yes;
+            if (Answer == EAppReturnType::Yes)
+            {
+                ExistingFileAction = bPreserveImplementation
+                    ? PuertsBlueprintTsGenerator::EExistingFileAction::
+                          UpdateTemplatePreservingImplementation
+                    : PuertsBlueprintTsGenerator::EExistingFileAction::Overwrite;
+            }
         }
 
         int32 GeneratedCount = 0;
+        int32 UpdatedCount = 0;
         int32 SkippedCount = 0;
         int32 FailedCount = 0;
         int32 AddedImportCount = 0;
+        int32 AddedGameInstanceReferenceCount = 0;
         FString FirstGeneratedDirectory;
         TArray<FString> ScriptFilesToImport;
 
         for (UBlueprint* Blueprint : Blueprints)
         {
             const FString OutputFile = GetOutputFilePath(Blueprint);
-            if (IFileManager::Get().FileExists(*OutputFile) &&
-                !bOverwriteExistingFiles)
+            const bool bFileExists =
+                IFileManager::Get().FileExists(*OutputFile);
+            if (bFileExists &&
+                ExistingFileAction ==
+                    PuertsBlueprintTsGenerator::EExistingFileAction::Skip)
             {
                 ++SkippedCount;
                 ScriptFilesToImport.Add(OutputFile);
@@ -414,9 +771,26 @@ private:
             }
 
             FString ErrorMessage;
-            if (GenerateBlueprintScript(Blueprint, OutputFile, ErrorMessage))
+            const bool bUpdateExistingTemplate = bFileExists &&
+                ExistingFileAction ==
+                    PuertsBlueprintTsGenerator::EExistingFileAction::
+                        UpdateTemplatePreservingImplementation;
+            const bool bSucceeded = bUpdateExistingTemplate
+                ? UpdateExistingBlueprintScriptTemplate(
+                      Blueprint,
+                      OutputFile,
+                      ErrorMessage)
+                : GenerateBlueprintScript(Blueprint, OutputFile, ErrorMessage);
+            if (bSucceeded)
             {
-                ++GeneratedCount;
+                if (bUpdateExistingTemplate)
+                {
+                    ++UpdatedCount;
+                }
+                else
+                {
+                    ++GeneratedCount;
+                }
                 ScriptFilesToImport.Add(OutputFile);
                 if (FirstGeneratedDirectory.IsEmpty())
                 {
@@ -449,17 +823,38 @@ private:
                 *ImportErrorMessage);
         }
 
+        FString GameInstanceBindingErrorMessage;
+        const bool bGameInstanceBindingSucceeded =
+            BindBlueprintsToGameInstance(
+                Blueprints,
+                AddedGameInstanceReferenceCount,
+                GameInstanceBindingErrorMessage);
+        if (!bGameInstanceBindingSucceeded)
+        {
+            UE_LOG(
+                LogPuertsBlueprintTsGenerator,
+                Error,
+                TEXT("Failed to bind Blueprint classes to GameInstance: %s"),
+                *GameInstanceBindingErrorMessage);
+        }
+
         const FText ResultText = FText::Format(
             LOCTEXT(
                 "GenerationResult",
-                "Puerts TS：生成 {0}，跳过 {1}，失败 {2}，MainGame 导入 {3}{4}"),
+                "Puerts TS：生成 {0}，更新模板 {1}，跳过 {2}，失败 {3}，"
+                "MainGame 导入 {4}{5}，GameInstance 硬引用 +{6}{7}"),
             FText::AsNumber(GeneratedCount),
+            FText::AsNumber(UpdatedCount),
             FText::AsNumber(SkippedCount),
             FText::AsNumber(FailedCount),
             FText::AsNumber(AddedImportCount),
             bImportsUpdated
                 ? FText::GetEmpty()
-                : LOCTEXT("MainGameImportFailed", "（更新失败）"));
+                : LOCTEXT("MainGameImportFailed", "（更新失败）"),
+            FText::AsNumber(AddedGameInstanceReferenceCount),
+            bGameInstanceBindingSucceeded
+                ? FText::GetEmpty()
+                : LOCTEXT("GameInstanceBindingFailed", "（绑定或保存失败）"));
 
         FNotificationInfo Notification(ResultText);
         Notification.ExpireDuration = 6.f;
@@ -696,6 +1091,131 @@ private:
         return true;
     }
 
+    bool UpdateExistingBlueprintScriptTemplate(
+        UBlueprint* Blueprint,
+        const FString& OutputFile,
+        FString& OutErrorMessage) const
+    {
+        if (!IsValid(Blueprint) || !IsValid(Blueprint->GeneratedClass))
+        {
+            OutErrorMessage = TEXT("蓝图没有有效的 GeneratedClass，请先编译蓝图。");
+            return false;
+        }
+
+        FString ExistingContent;
+        if (!FFileHelper::LoadFileToString(ExistingContent, *OutputFile))
+        {
+            OutErrorMessage = FString::Printf(
+                TEXT("无法读取已有 TypeScript 文件：%s"),
+                *OutputFile);
+            return false;
+        }
+
+        const FString PackageName = Blueprint->GetOutermost()->GetName();
+        const FString Namespace =
+            PuertsBlueprintTsGenerator::BuildTypeScriptNamespace(PackageName);
+        const FString GeneratedClassName =
+            PuertsBlueprintTsGenerator::SanitizeTypeScriptIdentifier(
+                Blueprint->GeneratedClass->GetName());
+        const FString UnrealTypeName = FString::Printf(
+            TEXT("UE.%s.%s"),
+            *Namespace,
+            *GeneratedClassName);
+        const FString GeneratedClassPath =
+            Blueprint->GeneratedClass->GetPathName();
+        const FString Newline = ExistingContent.Contains(TEXT("\r\n"))
+            ? TEXT("\r\n")
+            : TEXT("\n");
+        const FString ClassLoadLoaderBlock =
+            PuertsBlueprintTsGenerator::BuildClassLoadLoaderBlock(
+                GeneratedClassPath,
+                Newline);
+        const FString StaleStaticClassLoaderBlock =
+            PuertsBlueprintTsGenerator::BuildStaleStaticClassLoaderBlock(
+                UnrealTypeName,
+                Newline);
+        const FString ReloadedStaticClassLoaderBlock =
+            PuertsBlueprintTsGenerator::BuildReloadedStaticClassLoaderBlock(
+                UnrealTypeName,
+                Newline);
+
+        int32 LegacyLoaderStartIndex = INDEX_NONE;
+        int32 LegacyLoaderLength = 0;
+        const bool bContainsLegacyLoader =
+            PuertsBlueprintTsGenerator::FindLegacyBlueprintLoaderRange(
+                ExistingContent,
+                GeneratedClassPath,
+                LegacyLoaderStartIndex,
+                LegacyLoaderLength);
+        const bool bContainsClassLoadLoader =
+            ExistingContent.Contains(ClassLoadLoaderBlock);
+        const bool bContainsStaleStaticClassLoader =
+            ExistingContent.Contains(StaleStaticClassLoaderBlock);
+        const bool bContainsReloadedStaticClassLoader =
+            ExistingContent.Contains(ReloadedStaticClassLoaderBlock);
+        if (!bContainsLegacyLoader &&
+            !bContainsClassLoadLoader &&
+            !bContainsStaleStaticClassLoader &&
+            !bContainsReloadedStaticClassLoader)
+        {
+            OutErrorMessage =
+                TEXT("无法识别生成器负责的蓝图加载模板；为保护已有逻辑，文件未修改。");
+            return false;
+        }
+
+        bool bChanged = false;
+        if (bContainsReloadedStaticClassLoader)
+        {
+            ExistingContent.ReplaceInline(
+                *ReloadedStaticClassLoaderBlock,
+                *ClassLoadLoaderBlock,
+                ESearchCase::CaseSensitive);
+            bChanged = true;
+        }
+        else if (bContainsStaleStaticClassLoader)
+        {
+            ExistingContent.ReplaceInline(
+                *StaleStaticClassLoaderBlock,
+                *ClassLoadLoaderBlock,
+                ESearchCase::CaseSensitive);
+            bChanged = true;
+        }
+        else if (bContainsLegacyLoader && !bContainsClassLoadLoader)
+        {
+            ExistingContent = ExistingContent.Left(LegacyLoaderStartIndex) +
+                ClassLoadLoaderBlock +
+                ExistingContent.Mid(
+                    LegacyLoaderStartIndex + LegacyLoaderLength);
+            bChanged = true;
+        }
+
+        if (PuertsBlueprintTsGenerator::ReplaceTypeScriptIdentifier(
+                ExistingContent,
+                TEXT("jsClass"),
+                TEXT("JSClass")) > 0)
+        {
+            bChanged = true;
+        }
+
+        if (!bChanged)
+        {
+            return true;
+        }
+
+        if (!FFileHelper::SaveStringToFile(
+                ExistingContent,
+                *OutputFile,
+                FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+        {
+            OutErrorMessage = FString::Printf(
+                TEXT("无法更新已有 TypeScript 文件：%s"),
+                *OutputFile);
+            return false;
+        }
+
+        return true;
+    }
+
     bool GenerateBlueprintScript(
         UBlueprint* Blueprint,
         const FString& OutputFile,
@@ -720,9 +1240,6 @@ private:
             TEXT("UE.%s.%s"),
             *Namespace,
             *GeneratedClassName);
-        const FString GeneratedClassPath =
-            Blueprint->GeneratedClass->GetPathName();
-
         FString LifecycleStub;
         const UPuertsBlueprintTsGeneratorSettings* Settings =
             GetDefault<UPuertsBlueprintTsGeneratorSettings>();
@@ -753,6 +1270,7 @@ private:
             TEXT("const UClass = UE.Class.Load(\n")
             TEXT("  \"%s\",\n")
             TEXT(");\n")
+            TEXT("\n")
             TEXT("const JSClass = blueprint.tojs(UClass);\n")
             TEXT("\n")
             TEXT("interface %s\n")
@@ -765,7 +1283,7 @@ private:
             TEXT("blueprint.mixin(JSClass, %s);\n"),
             *Namespace,
             *GeneratedClassName,
-            *GeneratedClassPath,
+            *Blueprint->GeneratedClass->GetPathName(),
             *TypeScriptClassName,
             *UnrealTypeName,
             *TypeScriptClassName,

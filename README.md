@@ -12,15 +12,6 @@ Puerts `blueprint.mixin` TypeScript 模板。
 5. 也可以打开任意 Blueprint，点击编辑器顶部带 Puerts 图标的“生成 TS”按钮；
    它会直接为当前 Blueprint 执行同一套生成流程。
 
-生成成功后，插件会同时在 `TypeScript/MainGame.ts` 中补充对应的副作用导入：
-
-```ts
-import "./HarBin/Core/Building/BP_Building";
-```
-
-已经存在的导入不会重复添加。即使目标 `.ts` 已经存在并在覆盖提示中选择“否”，
-插件仍会检查并补齐入口文件中的导入。
-
 默认路径映射：
 
 ```text
@@ -34,14 +25,20 @@ import "./HarBin/Core/Building/BP_Building";
 编辑 -> 项目设置 -> 插件 -> Puerts Blueprint TypeScript Generator
 ```
 
-入口文件默认是输出目录下的 `MainGame.ts`，也可以在同一设置页面关闭自动导入，或
-修改入口文件的相对路径。
-
 已有文件默认不会直接覆盖。批量生成中发现已有文件时，插件会先询问：
 
-- 是：覆盖已有模板。
+- 是：更新蓝图加载模板，保留已有 import、接口扩展、类方法和其他手写逻辑。
 - 否：只创建缺失文件。
 - 取消：停止本次生成。
+
+如确实需要恢复旧版的完整覆盖行为，可在插件设置中关闭
+`Preserve Existing Implementation When Regenerating`。
+
+默认还会把每个生成模板的 Blueprint GeneratedClass 加入项目当前 GameInstance
+蓝图 Class Defaults 中的 `Puerts Mixin Blueprint Classes` 数组。该数组是硬类引用，
+可以让 Cooker 发现只在 TypeScript 中使用的蓝图。已有脚本选择“跳过”时也会补充引用。
+如不需要，可在插件设置中关闭
+`Bind Generated Blueprints to GameInstance`。
 
 ## 实现思路
 
@@ -125,6 +122,7 @@ declare module "ue" {
 const UClass = UE.Class.Load(
   "/Game/GZNY/Core/Subsystem/BP_PZTActor.BP_PZTActor_C",
 );
+
 const JSClass = blueprint.tojs(UClass);
 
 interface TS_BP_PZTActor
@@ -137,6 +135,10 @@ class TS_BP_PZTActor implements TS_BP_PZTActor {
 blueprint.mixin(JSClass, TS_BP_PZTActor);
 ```
 
+模板使用 Blueprint GeneratedClass 的完整对象路径调用 `UE.Class.Load`，再把返回的
+`UClass` 传给 `blueprint.tojs`，避免依赖 `blueprint.load` 对懒加载命名空间占位对象的
+替换行为。
+
 生成前要求 Blueprint 已具有有效的 `GeneratedClass`。如果蓝图尚未成功编译，插件
 会跳过该蓝图并在 Output Log 中说明原因。
 
@@ -148,12 +150,15 @@ blueprint.mixin(JSClass, TS_BP_PZTActor);
 
 生成器先统计目标路径中已经存在的 `.ts` 文件。存在冲突时统一询问一次：
 
-- 覆盖：重新生成全部所选 Blueprint 的模板。
+- 更新模板：把 `BPClass + blueprint.load + StaticClass()` 及 1.2.1 的重新获取类模板
+  迁移回 `UE.Class.Load + blueprint.tojs`，并把生成器创建的 `jsClass` 标识符更新为
+  `JSClass`；文件中的业务 import、接口扩展、类方法和辅助函数保持原样。
 - 跳过：保留已有脚本，只补充缺失文件。
 - 取消：不写入任何文件。
 
-这样显式右键生成不会在保存 Blueprint 时自动覆盖业务代码。执行完成后通过编辑器
-Notification 显示生成、跳过和失败数量，详细错误同时写入 Output Log。
+如果已有文件中的加载块已经被手动改成生成器无法识别的形式，迁移会失败并保持原文件
+不变。可以在插件设置中关闭保留选项，显式选择完整覆盖。执行完成后通过编辑器
+Notification 显示生成、更新模板、跳过和失败数量，详细错误同时写入 Output Log。
 
 ### 7. 生成流程
 
@@ -165,11 +170,23 @@ Notification 显示生成、跳过和失败数量，详细错误同时写入 Out
     -> 检查已有文件并确认覆盖策略
     -> 创建镜像目录
     -> 生成 blueprint.mixin 模板
-    -> 向 MainGame.ts 补充去重后的相对 import
+    -> 将 GeneratedClass 硬引用写入并保存当前 GameInstance 蓝图
     -> UTF-8 写入并显示结果通知
 ```
 
-### 8. 主要源码
+### 8. GameInstance Cook 硬引用
+
+项目当前 GameInstance 由 `DefaultEngine.ini` 的 `GameInstanceClass` 指定。生成器加载
+这个类，在其 Class Defaults 的 `PuertsMixinBlueprintClasses` 数组中去重追加本次处理的
+Blueprint GeneratedClass，然后自动保存 GameInstance 蓝图。由于 GameInstance 自身是
+游戏启动根资产，Cooker 会沿硬类引用把这些 Mixin 蓝图及其依赖一并 Cook。
+
+该属性定义在 `UTwinScriptGameInstance` 中。若项目未配置 GameInstance 蓝图、当前类不继承
+这个基类、DTSCore 尚未重新编译，或者资产保存失败，生成器不会静默忽略，而会在
+Notification 和 Output Log 中报告绑定错误。已在内存中写入但自动保存失败时，可以手动
+保存 GameInstance 蓝图。
+
+### 9. 主要源码
 
 ```text
 PuertsBlueprintTsGenerator.uplugin
